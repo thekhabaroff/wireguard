@@ -162,6 +162,30 @@ get_peers() {
   awk -F= '$1 == "PEERS" { print substr($0, index($0, "=") + 1); exit }' "$ENV_FILE"
 }
 
+get_peer_dns() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  awk -F= '$1 == "PEERDNS" { print substr($0, index($0, "=") + 1); exit }' "$ENV_FILE"
+}
+
+set_peer_dns() {
+  local value="$1"
+  local temporary
+  touch "$ENV_FILE"
+  temporary="$(mktemp "$BASE_DIR/.env.XXXXXX")"
+  awk -v value="$value" '
+    BEGIN { updated = 0 }
+    /^PEERDNS=/ {
+      if (!updated) print "PEERDNS=" value
+      updated = 1
+      next
+    }
+    { print }
+    END { if (!updated) print "PEERDNS=" value }
+  ' "$ENV_FILE" > "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$ENV_FILE"
+}
+
 validate_peers() {
   local value="$1"
   local item
@@ -178,6 +202,35 @@ validate_peers() {
     done
   done
   ((${#items[@]} > 0)) || die "список клиентских профилей пуст"
+}
+
+validate_peer_dns() {
+  local value="$1"
+  local item previous_index index
+  local -a servers=()
+
+  [[ "$value" == auto ]] && return 0
+  IFS=',' read -r -a servers <<< "$value"
+  if ((${#servers[@]} < 1 || ${#servers[@]} > 3)); then
+    printf 'Укажи auto или от одного до трёх IPv4-адресов DNS через запятую.\n' >&2
+    return 1
+  fi
+
+  for ((index = 0; index < ${#servers[@]}; index++)); do
+    item="${servers[index]}"
+    [[ "$item" =~ ^[0-9.]+$ ]] && is_valid_server_url "$item" && \
+      [[ "$item" != 0.0.0.0 && "$item" != 255.255.255.255 ]] || {
+      printf 'Некорректный IPv4-адрес DNS: %s\n' "$item" >&2
+      return 1
+    }
+    for ((previous_index = 0; previous_index < index; previous_index++)); do
+      if [[ "${servers[previous_index]}" == "$item" ]]; then
+        printf 'DNS-адрес %s указан повторно.\n' "$item" >&2
+        return 1
+      fi
+    done
+  done
+  return 0
 }
 
 is_valid_server_url() {
@@ -249,6 +302,33 @@ replace_compose_peers_reference() {
   chmod 600 "$temporary"
   mv -f "$temporary" "$COMPOSE_FILE"
   printf 'Обновил PEERS в compose.yaml; резервная копия: %s\n' "$backup"
+}
+
+replace_compose_peer_dns_reference() {
+  local backup temporary
+  grep -Eq '^[[:space:]]*PEERDNS:' "$COMPOSE_FILE" || \
+    die "в compose.yaml нет параметра PEERDNS; проверь конфигурацию вручную"
+
+  # Keep the Compose interpolation literal so it is expanded from .env.
+  # shellcheck disable=SC2016
+  if grep -F 'PEERDNS:' "$COMPOSE_FILE" | grep -Fq '${PEERDNS'; then
+    return 0
+  fi
+
+  backup="$COMPOSE_FILE.bak.peerdns.$(date +%Y%m%d%H%M%S)"
+  cp -a "$COMPOSE_FILE" "$backup"
+  temporary="$(mktemp "$BASE_DIR/compose.yaml.XXXXXX")"
+  awk '
+    /^[[:space:]]*PEERDNS:/ {
+      match($0, /^[[:space:]]*/)
+      print substr($0, RSTART, RLENGTH) "PEERDNS: \"${PEERDNS}\""
+      next
+    }
+    { print }
+  ' "$COMPOSE_FILE" > "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$COMPOSE_FILE"
+  printf 'Перевёл PEERDNS в compose.yaml на настройку из .env; резервная копия: %s\n' "$backup"
 }
 
 compose() {
@@ -405,6 +485,44 @@ show_existing_qr() {
   show_peer_qr "$name" || printf 'Не удалось вывести QR-код профиля %s.\n' "$name" >&2
 }
 
+configure_peer_dns() {
+  local old_dns new_dns
+  old_dns="$(get_peer_dns)"
+  old_dns="${old_dns:-1.1.1.1,1.0.0.1}"
+
+  read -r -p "DNS для клиентских профилей [$old_dns]: " new_dns
+  new_dns="${new_dns:-$old_dns}"
+  new_dns="${new_dns//[[:space:]]/}"
+  if ! validate_peer_dns "$new_dns"; then
+    printf 'DNS-настройка не изменена.\n' >&2
+    return
+  fi
+  if [[ "$new_dns" == "$old_dns" ]]; then
+    printf 'DNS не изменился.\n'
+    return
+  fi
+
+  set_peer_dns "$new_dns"
+  if ! compose config >/dev/null; then
+    set_peer_dns "$old_dns"
+    printf 'Новая DNS-настройка не прошла проверку Compose; оставил прежнюю настройку %s.\n' "$old_dns" >&2
+    return
+  fi
+  if ! compose_up || ! verify_wireguard; then
+    printf 'WireGuard не подтвердил запуск с новой DNS-настройкой. Возвращаю прежнюю настройку. Логи контейнера:\n' >&2
+    show_wireguard_logs
+    set_peer_dns "$old_dns"
+    if ! compose_up || ! verify_wireguard; then
+      printf 'Не удалось подтвердить восстановление прежней DNS-настройки. Проверь логи контейнера.\n' >&2
+      show_wireguard_logs
+    fi
+    return
+  fi
+
+  printf 'DNS обновлён: %s. Контейнер перезапущен, клиентские конфиги обновлены с прежними ключами.\n' "$new_dns"
+  printf 'Импортируй обновлённые конфиги на устройствах; QR-коды доступны в пункте 3 меню.\n'
+}
+
 remove_installation() {
   local confirmation
   printf 'Будут удалены контейнер, Compose-сеть, образ и все данные в %s.\n' "$BASE_DIR"
@@ -444,6 +562,7 @@ menu() {
     printf '5) Показать состояние WireGuard\n'
     printf '6) Обновить Docker-образ WireGuard\n'
     printf '7) Полностью удалить WireGuard\n'
+    printf '8) Изменить DNS в клиентских профилях\n'
     printf '0) Выход\n'
     read -r -p 'Выбери действие: ' choice || exit 0
 
@@ -455,6 +574,7 @@ menu() {
       5) compose exec -T "$SERVICE" wg show wg0 || printf 'Контейнер WireGuard или интерфейс wg0 не запущен.\n' ;;
       6) update_wireguard_image || true ;;
       7) remove_installation ;;
+      8) configure_peer_dns ;;
       0) exit 0 ;;
       *) printf 'Нет такого пункта меню.\n' ;;
     esac
@@ -463,6 +583,7 @@ menu() {
 
 setup_existing_installation() {
   local old_value default_value input_value
+  local peer_dns dns_migrated=0
   [[ -f "$COMPOSE_FILE" ]] || die "не найден $COMPOSE_FILE"
 
   old_value="$(get_peers)"
@@ -490,7 +611,16 @@ setup_existing_installation() {
     validate_peers "$old_value"
   fi
 
+  peer_dns="$(get_peer_dns)"
+  if [[ -z "$peer_dns" ]]; then
+    peer_dns=1.1.1.1,1.0.0.1
+    set_peer_dns "$peer_dns"
+    dns_migrated=1
+  fi
+  validate_peer_dns "$peer_dns" || die "исправь параметр PEERDNS в $ENV_FILE"
+
   replace_compose_peers_reference
+  replace_compose_peer_dns_reference
   chmod 600 "$ENV_FILE"
   compose config >/dev/null || die "Compose-файл не прошёл проверку"
   compose up -d || die "не удалось запустить WireGuard; проверь логи контейнера"
@@ -500,10 +630,13 @@ setup_existing_installation() {
     die "проверь ошибки выше"
   fi
   printf 'Нашёл существующую конфигурацию WireGuard в %s.\n' "$BASE_DIR"
+  if ((dns_migrated == 1)); then
+    printf 'Добавил резервный DNS 1.0.0.1. Клиентские профили обновлены с прежними ключами; импортируй обновлённые конфиги из меню или отсканируй их QR-коды заново.\n'
+  fi
 }
 
 install_new_instance() {
-  local server_url server_port peers_input first_peer puid pgid port_number
+  local server_url server_port peers_input first_peer puid pgid port_number peer_dns
   local compose_tmp
 
   check_ubuntu_2404
@@ -525,13 +658,18 @@ install_new_instance() {
   peers_input="${peers_input//[[:space:]]/}"
   validate_peers "$peers_input"
 
+  read -r -p 'DNS для клиентов: auto или IPv4-адреса через запятую [1.1.1.1,1.0.0.1]: ' peer_dns
+  peer_dns="${peer_dns:-1.1.1.1,1.0.0.1}"
+  peer_dns="${peer_dns//[[:space:]]/}"
+  validate_peer_dns "$peer_dns" || die "укажи корректный DNS-адрес"
+
   puid="${SUDO_UID:-1000}"
   pgid="${SUDO_GID:-1000}"
   [[ "$puid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ ]] || die "не удалось определить PUID/PGID"
 
   install -d -m 0755 "$BASE_DIR"
   install -d -m 0700 -o "$puid" -g "$pgid" "$CONFIG_DIR"
-  printf 'PEERS=%s\n' "$peers_input" > "$ENV_FILE"
+  printf 'PEERS=%s\nPEERDNS=%s\n' "$peers_input" "$peer_dns" > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 
   compose_tmp="$(mktemp "$BASE_DIR/compose.yaml.XXXXXX")"
@@ -549,7 +687,7 @@ services:
       SERVERURL: "$server_url"
       SERVERPORT: "$server_port"
       PEERS: "\${PEERS}"
-      PEERDNS: "1.1.1.1"
+      PEERDNS: "\${PEERDNS}"
       INTERNAL_SUBNET: "10.13.13.0"
       ALLOWEDIPS: "0.0.0.0/0"
       LOG_CONFS: "false"
