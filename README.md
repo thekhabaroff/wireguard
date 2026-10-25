@@ -9,7 +9,7 @@
 Выполни на сервере Ubuntu 24.04 с установленным `curl`. Скрипт сохранит себя в `/usr/local/sbin/wireguard.sh`, установит WireGuard и откроет меню.
 
 ```bash
-f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/thekhabaroff/wireguard/master/wireguard/wireguard.sh -o "$f" && sudo bash "$f" && rm "$f"
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/thekhabaroff/wireguard/master/wireguard.sh -o "$f" && sudo bash "$f" && rm "$f"
 ```
 
 При первом запуске скрипт проверит Ubuntu 24.04, установит Docker Engine и Compose при необходимости, затем попросит адрес сервера, UDP-порт и имена клиентских профилей. После запуска он покажет QR-код первого профиля.
